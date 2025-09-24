@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Speed Cook</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <!-- Firebase SDK -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, addDoc, doc, deleteDoc, onSnapshot, query, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Variabili globali fornite dall'ambiente
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let db, auth;
+        let userId;
+
+        setLogLevel('debug');
+        
+        const ingredientsInput = document.getElementById('ingredientsInput');
+        const fileInput = document.getElementById('fileInput');
+        const fileNameSpan = document.getElementById('fileName');
+        const imagePreviewContainer = document.getElementById('imagePreviewContainer');
+        const imagePreview = document.getElementById('imagePreview');
+        const generateBtn = document.getElementById('generateBtn');
+        const loadingIndicator = document.getElementById('loadingIndicator');
+        const errorContainer = document.getElementById('errorContainer');
+        const errorMessageSpan = document.getElementById('errorMessage');
+        const recipesContainer = document.getElementById('recipesContainer');
+        const savedRecipesContainer = document.getElementById('savedRecipesContainer');
+        const messageBox = document.getElementById('messageBox');
+
+        const apiKey = "";
+        const apiUrl = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent";
+
+        function showLoading() {
+            loadingIndicator.classList.remove('hidden');
+            generateBtn.disabled = true;
+            recipesContainer.innerHTML = '';
+            errorContainer.classList.add('hidden');
+        }
+
+        function hideLoading() {
+            loadingIndicator.classList.add('hidden');
+            generateBtn.disabled = false;
+        }
+
+        function displayError(message) {
+            errorMessageSpan.textContent = message;
+            errorContainer.classList.remove('hidden');
+        }
+
+        function displayMessage(message, type) {
+            messageBox.textContent = message;
+            messageBox.className = `message-box ${type}`;
+            messageBox.style.opacity = '1';
+            messageBox.classList.remove('hidden');
+            setTimeout(() => {
+                messageBox.style.opacity = '0';
+                messageBox.classList.add('hidden');
+            }, 3000);
+        }
+        
+        function displayRecipes(recipes) {
+            recipesContainer.innerHTML = '';
+            recipes.forEach(recipe => {
+                const recipeCard = document.createElement('div');
+                recipeCard.className = 'recipe-card flex flex-col justify-between';
+                recipeCard.innerHTML = `
+                    <div>
+                        <h2 class="text-2xl font-bold text-gray-800 mb-4">${recipe.recipeName}</h2>
+                        <h3 class="font-semibold text-teal-700 mb-2">Ingredienti:</h3>
+                        <ul class="list-disc list-inside text-gray-600 mb-6">
+                            ${recipe.ingredients.map(ingredient => `<li>${ingredient}</li>`).join('')}
+                        </ul>
+                        <h3 class="font-semibold text-teal-700 mb-2">Istruzioni:</h3>
+                        <p class="text-gray-600 leading-relaxed">${recipe.instructions}</p>
+                    </div>
+                    <button class="mt-4 w-full bg-blue-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-blue-700 transition-colors" onclick='window.app.saveRecipe(${JSON.stringify(recipe)})'>Salva Ricetta</button>
+                `;
+                recipesContainer.appendChild(recipeCard);
+            });
+        }
+
+        function displaySavedRecipes(recipes) {
+            savedRecipesContainer.innerHTML = '';
+            if (recipes.length === 0) {
+                savedRecipesContainer.innerHTML = '<p class="text-center text-gray-500">Nessuna ricetta salvata al momento.</p>';
+                return;
+            }
+            recipes.forEach(recipe => {
+                const recipeCard = document.createElement('div');
+                recipeCard.className = 'recipe-card flex flex-col justify-between';
+                recipeCard.innerHTML = `
+                    <div>
+                        <h2 class="text-2xl font-bold text-gray-800 mb-4">${recipe.recipeName}</h2>
+                        <h3 class="font-semibold text-teal-700 mb-2">Ingredienti:</h3>
+                        <ul class="list-disc list-inside text-gray-600 mb-6">
+                            ${recipe.ingredients.map(ingredient => `<li>${ingredient}</li>`).join('')}
+                        </ul>
+                        <h3 class="font-semibold text-teal-700 mb-2">Istruzioni:</h3>
+                        <p class="text-gray-600 leading-relaxed">${recipe.instructions}</p>
+                    </div>
+                    <button class="mt-4 w-full bg-red-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-red-700 transition-colors" onclick="window.app.deleteRecipe('${recipe.id}')">Cancella Ricetta</button>
+                `;
+                savedRecipesContainer.appendChild(recipeCard);
+            });
+        }
+
+        async function fetchWithExponentialBackoff(url, options, maxRetries = 5, retryDelay = 1000) {
+            for (let i = 0; i < maxRetries; i++) {
+                try {
+                    const response = await fetch(url, options);
+                    if (response.status !== 429) {
+                        return response;
+                    }
+                } catch (error) {
+                    console.error('Fetch failed, retrying...', error);
+                }
+                await new Promise(resolve => setTimeout(resolve, retryDelay * Math.pow(2, i)));
+            }
+            throw new Error('Max retries exceeded');
+        }
+
+        async function getRecipes(payload) {
+            try {
+                const response = await fetchWithExponentialBackoff(`${apiUrl}?key=${apiKey}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`Errore HTTP! Stato: ${response.status}`);
+                }
+
+                const result = await response.json();
+                const contentText = result.candidates?.[0]?.content?.parts?.[0]?.text;
+                
+                if (!contentText) {
+                    displayError("Nessuna ricetta trovata. Prova a inserire ingredienti diversi.");
+                    return;
+                }
+
+                const parsedJson = JSON.parse(contentText);
+                const recipes = parsedJson.recipes;
+
+                if (!recipes || recipes.length === 0) {
+                    displayError("Nessuna ricetta trovata. Prova a inserire ingredienti diversi.");
+                    return;
+                }
+
+                displayRecipes(recipes);
+            } catch (e) {
+                displayError("Si è verificato un errore durante la generazione. Riprova.");
+                console.error(e);
+            } finally {
+                hideLoading();
+            }
+        }
+
+        const initFirebase = async () => {
+            if (Object.keys(firebaseConfig).length > 0) {
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        document.getElementById('userIdDisplay').textContent = `ID Utente: ${userId}`;
+                        setupSavedRecipesListener();
+                    } else {
+                        userId = null;
+                        document.getElementById('userIdDisplay').textContent = '';
+                    }
+                });
+
+                try {
+                    if (initialAuthToken) {
+                        await signInWithCustomToken(auth, initialAuthToken);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
+                } catch (error) {
+                    console.error("Errore di autenticazione Firebase:", error);
+                    await signInAnonymously(auth);
+                }
+            } else {
+                console.error("Firebase config not available. App will not save data.");
+            }
+        };
+
+        const setupSavedRecipesListener = () => {
+            if (!db || !userId) return;
+            const savedRecipesCollection = collection(db, `artifacts/${appId}/users/${userId}/saved-recipes`);
+            const q = query(savedRecipesCollection);
+            onSnapshot(q, (snapshot) => {
+                const savedRecipes = [];
+                snapshot.forEach((doc) => {
+                    savedRecipes.push({ id: doc.id, ...doc.data() });
+                });
+                displaySavedRecipes(savedRecipes);
+            });
+        };
+
+        const saveRecipe = async (recipe) => {
+            if (!userId) {
+                displayMessage("Per favore, accedi per salvare le ricette.", "error");
+                return;
+            }
+            try {
+                await addDoc(collection(db, `artifacts/${appId}/users/${userId}/saved-recipes`), recipe);
+                displayMessage("Ricetta salvata con successo!", "success");
+            } catch (e) {
+                console.error("Errore nell'aggiunta del documento: ", e);
+                displayMessage("Errore nel salvataggio della ricetta.", "error");
+            }
+        };
+
+        const deleteRecipe = async (recipeId) => {
+            if (!userId) {
+                displayMessage("Per favore, accedi per cancellare le ricette.", "error");
+                return;
+            }
+            try {
+                await deleteDoc(doc(db, `artifacts/${appId}/users/${userId}/saved-recipes`, recipeId));
+                displayMessage("Ricetta cancellata con successo!", "success");
+            } catch (e) {
+                console.error("Errore nella cancellazione del documento: ", e);
+                displayMessage("Errore nella cancellazione della ricetta.", "error");
+            }
+        };
+
+        window.app = {
+            initFirebase,
+            saveRecipe,
+            deleteRecipe,
+        };
+
+        generateBtn.addEventListener('click', async () => {
+            showLoading();
+
+            const ingredients = ingredientsInput.value.trim();
+            const file = fileInput.files[0];
+
+            if (!ingredients && !file) {
+                hideLoading();
+                displayError("Per favore, inserisci gli ingredienti o carica un'immagine.");
+                return;
+            }
+
+            try {
+                if (file) {
+                    const reader = new FileReader();
+                    reader.readAsDataURL(file);
+                    reader.onload = async function() {
+                        const base64Data = reader.result.split(',')[1];
+                        const prompt = "Sei un assistente utile per un'app di cucina salutare. Innanzitutto, identifica gli ingredienti nell'immagine fornita. Quindi, in base a tali ingredienti, genera esattamente 4 ricette sane e a basso contenuto di grassi. La risposta deve essere un JSON valido. Ogni oggetto deve avere tre proprietà: 'recipeName' (string), 'ingredients' (un array di stringhe), e 'instructions' (una singola stringa). Assicurati di utilizzare solo gli ingredienti che puoi identificare nell'immagine. Se non riesci a creare 4 ricette, generane quante puoi.";
+                        const payload = {
+                            contents: [{
+                                parts: [
+                                    { text: prompt },
+                                    { inlineData: { mimeType: file.type, data: base64Data } }
+                                ]
+                            }],
+                            generationConfig: {
+                                responseMimeType: "application/json",
+                                responseSchema: {
+                                    type: "OBJECT",
+                                    properties: {
+                                        "recipes": {
+                                            "type": "ARRAY",
+                                            "items": {
+                                                "type": "OBJECT",
+                                                "properties": {
+                                                    "recipeName": { "type": "STRING" },
+                                                    "ingredients": {
+                                                        "type": "ARRAY",
+                                                        "items": { "type": "STRING" }
+                                                    },
+                                                    "instructions": { "type": "STRING" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        };
+                        await getRecipes(payload);
+                    };
+                } else if (ingredients) {
+                    const prompt = `Sei un assistente utile per un'app di cucina salutare. Basandoti sugli ingredienti forniti, genera esattamente 4 ricette sane e a basso contenuto di grassi. La risposta deve essere un JSON valido. Ogni oggetto deve avere tre proprietà: 'recipeName' (string), 'ingredients' (un array di stringhe), e 'instructions' (una singola stringa). Assicurati di utilizzare solo gli ingredienti che fornisco. Se non riesci a creare 4 ricette, generane quante puoi. Gli ingredienti disponibili sono: ${ingredients}.`;
+                    const payload = {
+                        contents: [{ parts: [{ text: prompt }] }],
+                        generationConfig: {
+                            responseMimeType: "application/json",
+                            responseSchema: {
+                                type: "OBJECT",
+                                properties: {
+                                    "recipes": {
+                                        "type": "ARRAY",
+                                        "items": {
+                                            "type": "OBJECT",
+                                            "properties": {
+                                                "recipeName": { "type": "STRING" },
+                                                "ingredients": {
+                                                    "type": "ARRAY",
+                                                    "items": { "type": "STRING" }
+                                                },
+                                                "instructions": { "type": "STRING" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    await getRecipes(payload);
+                }
+            } catch (e) {
+                hideLoading();
+                displayError("Si è verificato un errore durante la generazione. Riprova.");
+                console.error(e);
+            }
+        });
+
+        fileInput.addEventListener('change', (event) => {
+            const file = event.target.files[0];
+            if (file) {
+                fileNameSpan.textContent = file.name;
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    imagePreview.src = e.target.result;
+                    imagePreviewContainer.classList.remove('hidden');
+                };
+                reader.readAsDataURL(file);
+                ingredientsInput.value = '';
+            } else {
+                fileNameSpan.textContent = '';
+                imagePreviewContainer.classList.add('hidden');
+                imagePreview.src = '';
+            }
+        });
+    </script>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background: linear-gradient(to bottom right, #e0f2fe, #f0fdf4);
+            min-height: 100vh;
+        }
+        .container {
+            max-width: 800px;
+            margin: 2rem auto;
+            padding: 2.5rem;
+            background-color: #ffffff;
+            border-radius: 1.5rem;
+            box-shadow: 0 20px 50px -12px rgba(0, 0, 0, 0.25);
+        }
+        input[type="file"] {
+            display: none;
+        }
+        .custom-file-upload {
+            border: 2px dashed #b1c1d8;
+            color: #64748b;
+            cursor: pointer;
+            text-align: center;
+            padding: 1.5rem;
+            border-radius: 1rem;
+            transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        .custom-file-upload:hover {
+            background-color: #f1f5f9;
+            border-color: #94a3b8;
+        }
+        .recipe-card {
+            background-color: #f0f9ff;
+            padding: 2rem;
+            border-radius: 1rem;
+            border: 1px solid #e2e8f0;
+            transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        .recipe-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 20px -5px rgba(0, 0, 0, 0.1);
+        }
+        .loading-spinner {
+            border: 4px solid #f3f4f6;
+            border-top: 4px solid #06b6d4;
+            border-radius: 50%;
+            width: 32px;
+            height: 32px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        .message-box {
+            position: fixed;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            padding: 1rem 2rem;
+            border-radius: 0.75rem;
+            font-weight: 600;
+            z-index: 100;
+            opacity: 0;
+            transition: opacity 0.3s ease-in-out;
+        }
+        .message-box.success {
+            background-color: #d1fae5;
+            color: #065f46;
+        }
+        .message-box.error {
+            background-color: #fee2e2;
+            color: #991b1b;
+        }
+    </style>
+</head>
+<body onload="window.app.initFirebase()">
+
+    <div id="messageBox" class="message-box hidden"></div>
+
+    <div class="container">
+        <h1 class="text-4xl font-bold text-center text-gray-800 mb-4">Generatore di Ricette Salutari</h1>
+        <p class="text-center text-gray-600 mb-8">Inserisci i tuoi ingredienti o carica una foto per scoprire nuove ricette a basso contenuto di grassi.</p>
+        <p id="userIdDisplay" class="text-center text-gray-500 text-sm mb-4"></p>
+
+        <div class="mb-6">
+            <label for="ingredientsInput" class="block text-gray-700 font-semibold mb-2">Ingredienti (separati da virgola):</label>
+            <input type="text" id="ingredientsInput" placeholder="es. pollo, broccoli, riso" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-500 transition-colors">
+        </div>
+
+        <div class="flex items-center justify-between my-8">
+            <hr class="flex-grow border-gray-300">
+            <span class="mx-4 text-gray-500 font-medium">OPPURE</span>
+            <hr class="flex-grow border-gray-300">
+        </div>
+
+        <div class="mb-6">
+            <label for="fileInput" class="custom-file-upload flex flex-col items-center">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8 text-gray-400 mb-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
+                </svg>
+                <p class="text-gray-500 font-medium">Carica un'immagine degli ingredienti</p>
+                <p id="fileName" class="text-xs text-gray-400 mt-1"></p>
+            </label>
+            <input type="file" id="fileInput" accept="image/*">
+        </div>
+        
+        <div id="imagePreviewContainer" class="hidden mb-6">
+            <h3 class="text-lg font-semibold text-gray-700 mb-2">Anteprima Immagine:</h3>
+            <img id="imagePreview" class="rounded-xl max-w-full h-auto border border-gray-200 shadow-md">
+        </div>
+
+        <button id="generateBtn" class="w-full bg-teal-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-teal-700 transition-colors focus:outline-none focus:ring-2 focus:ring-teal-500 focus:ring-offset-2 shadow-md">
+            Genera Ricette
+        </button>
+
+        <div id="loadingIndicator" class="hidden flex flex-col justify-center items-center mt-8">
+            <div class="loading-spinner"></div>
+            <p class="ml-3 text-gray-600 mt-4">Generazione in corso...</p>
+        </div>
+
+        <div id="errorContainer" class="hidden mt-8 bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded-lg relative" role="alert">
+            <span class="block sm:inline" id="errorMessage"></span>
+        </div>
+
+        <div id="recipesContainer" class="mt-10 grid gap-6">
+            <!-- Le ricette verranno inserite qui dinamicamente -->
+        </div>
+
+        <!-- Sezione Ricette Salvate -->
+        <div id="savedRecipesSection" class="mt-16">
+            <div class="flex items-center justify-between mb-6">
+                <hr class="flex-grow border-gray-300">
+                <span class="mx-4 text-gray-500 font-medium text-2xl">Ricette Salvate</span>
+                <hr class="flex-grow border-gray-300">
+            </div>
+            <div id="savedRecipesContainer" class="grid gap-6">
+                <p class="text-center text-gray-500">Nessuna ricetta salvata al momento.</p>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
